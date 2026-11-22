@@ -2,6 +2,7 @@ import { defaultMetadataStorage } from './storage';
 import { ClassTransformOptions, TypeHelpOptions, TypeMetadata, TypeOptions } from './interfaces';
 import { TransformationType } from './enums';
 import { getGlobal, isPromise } from './utils';
+import { getJitCache, JitCache } from './TransformCompiler';
 
 function instantiateArrayType(arrayType: Function): Array<any> | Set<any> {
   const array = new (arrayType as any)();
@@ -17,12 +18,15 @@ export class TransformOperationExecutor {
   // -------------------------------------------------------------------------
 
   private recursionStack = new Set<Record<string, any>>();
+  private jit: JitCache | undefined;
 
   // -------------------------------------------------------------------------
   // Constructor
   // -------------------------------------------------------------------------
 
-  constructor(private transformationType: TransformationType, private options: ClassTransformOptions) {}
+  constructor(private transformationType: TransformationType, private options: ClassTransformOptions) {
+    this.jit = getJitCache(transformationType, options);
+  }
 
   // -------------------------------------------------------------------------
   // Public Methods
@@ -147,7 +151,35 @@ export class TransformOperationExecutor {
         this.recursionStack.add(value);
       }
 
-      const keys = this.getKeys(targetType as Function, value, isMap);
+      // use the compiled (JIT) transformer of this class when possible, see TransformCompiler
+      const compiled =
+        this.jit && !isMap && !(value instanceof Map) && !(source instanceof Map)
+          ? this.jit.get(targetType, this)
+          : undefined;
+      const newValue = compiled
+        ? compiled(this, source, value, level)
+        : this.transformObject(source, value, targetType as Function, isMap, level);
+
+      if (this.options.enableCircularCheck) {
+        this.recursionStack.delete(value);
+      }
+
+      return newValue;
+    } else {
+      return value;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Private Methods
+  // -------------------------------------------------------------------------
+
+  /**
+   * Interpreted transformation of a single object, used when no compiled transformer is available.
+   */
+  private transformObject(source: any, value: any, targetType: Function, isMap: boolean, level: number): any {
+    {
+      const keys = this.getKeys(targetType, value, isMap);
       let newValue: any = source ? source : {};
       if (
         !source &&
@@ -174,7 +206,7 @@ export class TransformOperationExecutor {
           propertyName = key;
         if (!this.options.ignoreDecorators && targetType) {
           if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
-            const exposeMetadata = defaultMetadataStorage.findExposeMetadataByCustomName(targetType as Function, key);
+            const exposeMetadata = defaultMetadataStorage.findExposeMetadataByCustomName(targetType, key);
             if (exposeMetadata) {
               propertyName = exposeMetadata.propertyName;
               newValueKey = exposeMetadata.propertyName;
@@ -183,7 +215,7 @@ export class TransformOperationExecutor {
             this.transformationType === TransformationType.CLASS_TO_PLAIN ||
             this.transformationType === TransformationType.CLASS_TO_CLASS
           ) {
-            const exposeMetadata = defaultMetadataStorage.findExposeMetadata(targetType as Function, key);
+            const exposeMetadata = defaultMetadataStorage.findExposeMetadata(targetType, key);
             if (exposeMetadata && exposeMetadata.options && exposeMetadata.options.name) {
               newValueKey = exposeMetadata.options.name;
             }
@@ -216,7 +248,7 @@ export class TransformOperationExecutor {
         if (targetType && isMap) {
           type = targetType;
         } else if (targetType) {
-          const metadata = defaultMetadataStorage.findTypeMetadata(targetType as Function, propertyName);
+          const metadata = defaultMetadataStorage.findTypeMetadata(targetType, propertyName);
           if (metadata) {
             const options: TypeHelpOptions = { newObject: newValue, object: value, property: propertyName };
             const newType = metadata.typeFunction ? metadata.typeFunction(options) : metadata.reflectedType;
@@ -268,11 +300,7 @@ export class TransformOperationExecutor {
           ) {
             // if we have no registererd type via the @Type() decorator then we check if we have any
             // type declarations in reflect-metadata (type declaration is emited only if some decorator is added to the property.)
-            const reflectedType = (Reflect as any).getMetadata(
-              'design:type',
-              (targetType as Function).prototype,
-              propertyName
-            );
+            const reflectedType = (Reflect as any).getMetadata('design:type', targetType.prototype, propertyName);
 
             if (reflectedType) {
               type = reflectedType;
@@ -281,9 +309,7 @@ export class TransformOperationExecutor {
         }
 
         // if value is an array try to get its custom array type
-        const arrayType = Array.isArray(value[valueKey])
-          ? this.getReflectedType(targetType as Function, propertyName)
-          : undefined;
+        const arrayType = Array.isArray(value[valueKey]) ? this.getReflectedType(targetType, propertyName) : undefined;
 
         // const subValueKey = TransformationType === TransformationType.PLAIN_TO_CLASS && newKeyName ? newKeyName : key;
         const subSource = source ? source[valueKey] : undefined;
@@ -316,7 +342,7 @@ export class TransformOperationExecutor {
             // Apply custom transformation
             finalValue = this.applyCustomTransformations(
               finalValue,
-              targetType as Function,
+              targetType,
               transformKey,
               value,
               this.transformationType
@@ -333,7 +359,7 @@ export class TransformOperationExecutor {
               finalValue = this.transform(subSource, subValue, type, arrayType, isSubValueMap, level + 1);
               finalValue = this.applyCustomTransformations(
                 finalValue,
-                targetType as Function,
+                targetType,
                 transformKey,
                 value,
                 this.transformationType
@@ -350,13 +376,7 @@ export class TransformOperationExecutor {
           }
         } else if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
           let finalValue = subValue;
-          finalValue = this.applyCustomTransformations(
-            finalValue,
-            targetType as Function,
-            key,
-            value,
-            this.transformationType
-          );
+          finalValue = this.applyCustomTransformations(finalValue, targetType, key, value, this.transformationType);
           if (finalValue !== undefined || this.options.exposeUnsetFields) {
             if (newValue instanceof Map) {
               newValue.set(newValueKey, finalValue);
@@ -367,13 +387,7 @@ export class TransformOperationExecutor {
         }
       }
 
-      if (this.options.enableCircularCheck) {
-        this.recursionStack.delete(value);
-      }
-
       return newValue;
-    } else {
-      return value;
     }
   }
 

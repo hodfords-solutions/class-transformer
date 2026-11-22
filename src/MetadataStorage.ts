@@ -14,12 +14,22 @@ export class MetadataStorage {
   private _exposeMetadatas = new Map<Function, Map<string, ExposeMetadata>>();
   private _excludeMetadatas = new Map<Function, Map<string, ExcludeMetadata>>();
   private _ancestorsMap = new Map<Function, Function[]>();
+  private _version = 0;
+
+  /**
+   * Incremented every time metadata is added or cleared.
+   * Used to invalidate compiled (JIT) transformers.
+   */
+  get version(): number {
+    return this._version;
+  }
 
   // -------------------------------------------------------------------------
   // Adder Methods
   // -------------------------------------------------------------------------
 
   addTypeMetadata(metadata: TypeMetadata): void {
+    this._version++;
     if (!this._typeMetadatas.has(metadata.target)) {
       this._typeMetadatas.set(metadata.target, new Map<string, TypeMetadata>());
     }
@@ -27,6 +37,7 @@ export class MetadataStorage {
   }
 
   addTransformMetadata(metadata: TransformMetadata): void {
+    this._version++;
     if (!this._transformMetadatas.has(metadata.target)) {
       this._transformMetadatas.set(metadata.target, new Map<string, TransformMetadata[]>());
     }
@@ -37,6 +48,7 @@ export class MetadataStorage {
   }
 
   addExposeMetadata(metadata: ExposeMetadata): void {
+    this._version++;
     if (!this._exposeMetadatas.has(metadata.target)) {
       this._exposeMetadatas.set(metadata.target, new Map<string, ExposeMetadata>());
     }
@@ -44,6 +56,7 @@ export class MetadataStorage {
   }
 
   addExcludeMetadata(metadata: ExcludeMetadata): void {
+    this._version++;
     if (!this._excludeMetadatas.has(metadata.target)) {
       this._excludeMetadatas.set(metadata.target, new Map<string, ExcludeMetadata>());
     }
@@ -155,10 +168,31 @@ export class MetadataStorage {
   }
 
   clear(): void {
+    this._version++;
     this._typeMetadatas.clear();
     this._exposeMetadatas.clear();
     this._excludeMetadatas.clear();
     this._ancestorsMap.clear();
+  }
+
+  /**
+   * Returns the names of all properties (of the target and its ancestors) having any kind of metadata.
+   */
+  getMetadataPropertyNames(target: Function): string[] {
+    const names: string[] = [];
+    const maps: Map<Function, Map<string, unknown>>[] = [
+      this._typeMetadatas,
+      this._transformMetadatas,
+      this._exposeMetadatas,
+      this._excludeMetadatas,
+    ];
+    for (const cls of [target, ...this.getAncestors(target)]) {
+      for (const metadatas of maps) {
+        const map = metadatas.get(cls);
+        if (map) map.forEach((_, name) => name !== undefined && names.push(name));
+      }
+    }
+    return names;
   }
 
   // -------------------------------------------------------------------------
