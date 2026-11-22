@@ -268,6 +268,59 @@ describe('compiled (JIT) transformation', () => {
     }
   });
 
+  it('gives the same results for unusual nested values', () => {
+    defaultMetadataStorage.clear();
+
+    class Item {
+      @Type(() => Number)
+      value: number;
+      name: string;
+    }
+
+    class SubItem extends Item {}
+
+    class ItemList extends Array<Item> {}
+
+    class Holder {
+      @Type(() => Item)
+      items: Item[];
+
+      @Type(() => Item)
+      item: Item;
+
+      @Type(() => Item)
+      itemSet: Set<Item>;
+    }
+
+    const sparse: any[] = [{ value: '1' }, , { value: '3' }]; // eslint-disable-line no-sparse-arrays
+    const customForEach: any[] = [{ value: '1' }, { value: '2' }];
+    customForEach.forEach = function (callback: any) {
+      Array.prototype.forEach.call([this[1]], callback);
+    };
+    const values = (): any[] => [
+      sparse,
+      customForEach,
+      [{ value: '1', then: () => 'not a promise' }],
+      [Object.assign(Object.create(null), { value: '2' })],
+      [Object.assign(new Item(), { value: '3' }), Object.assign(new SubItem(), { value: '4' })],
+      [1, 'a', null, undefined, true, new Date(0), new Map([['a', { value: '5' }]]), [{ value: '6' }]],
+      Object.assign(new ItemList(), { 0: { value: '7' }, length: 1 }),
+      new Set([{ value: '8' }]),
+      { value: '9', then: 1 },
+      Object.assign(new SubItem(), { value: '10' }),
+    ];
+
+    for (const options of [{}, { enableCircularCheck: true }]) {
+      values().forEach((value, index) => {
+        compare(() => plainToInstance(Holder, { items: values()[index], item: value, itemSet: value }, options));
+        compare(() => plainToInstance(Item, values()[index], options));
+        const holder = plainToInstance(Holder, { items: values()[index], item: value }, options);
+        compare(() => instanceToPlain(holder, options));
+        compare(() => instanceToInstance(holder, options));
+      });
+    }
+  });
+
   it('gives the same results for circular references', () => {
     defaultMetadataStorage.clear();
 
@@ -288,8 +341,22 @@ describe('compiled (JIT) transformation', () => {
     child.parent = root;
     root.children = [child];
 
+    // objects referencing themselves, transformed through arrays and properties
+    const self = new Node();
+    self.name = 'self';
+    self.parent = self;
+    self.children = [self];
+    root.children.push(self);
+    const selfPlain: any = { name: 'self' };
+    selfPlain.parent = selfPlain;
+    selfPlain.children = [selfPlain];
+
     compare(() => instanceToPlain(root, { enableCircularCheck: true }));
     compare(() => instanceToInstance(root, { enableCircularCheck: true }));
+    compare(() =>
+      plainToInstance(Node, { name: 'root', children: [selfPlain], parent: selfPlain }, { enableCircularCheck: true })
+    );
+    compare(() => plainToInstance(Node, [selfPlain], { enableCircularCheck: true }));
   });
 
   it('recompiles when metadata is added after a transformation', () => {

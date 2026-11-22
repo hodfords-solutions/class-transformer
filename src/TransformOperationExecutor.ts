@@ -2,7 +2,7 @@ import { defaultMetadataStorage } from './storage';
 import { ClassTransformOptions, TypeHelpOptions, TypeMetadata, TypeOptions } from './interfaces';
 import { TransformationType } from './enums';
 import { getGlobal, isPromise } from './utils';
-import { getJitCache, JitCache } from './TransformCompiler';
+import { CompiledTransformer, DirectTransformer, getJitCache, JitCache } from './TransformCompiler';
 
 function instantiateArrayType(arrayType: Function): Array<any> | Set<any> {
   const array = new (arrayType as any)();
@@ -45,6 +45,11 @@ export class TransformOperationExecutor {
         arrayType && this.transformationType === TransformationType.PLAIN_TO_CLASS
           ? instantiateArrayType(arrayType)
           : [];
+      // compiled transformer called directly for the elements, see TransformCompiler
+      const direct = this.jit && !source && typeof targetType === 'function' ? this.jit.direct(targetType, this) : null;
+      if (direct && Array.isArray(value) && value.forEach === Array.prototype.forEach) {
+        return this.transformArrayDirect(direct, value, newValue, targetType as Function, level);
+      }
       (value as any[]).forEach((subValue, index) => {
         const subSource = source ? source[index] : undefined;
         if (!this.options.enableCircularCheck || !this.isCircular(subValue)) {
@@ -80,14 +85,10 @@ export class TransformOperationExecutor {
           } else {
             realTargetType = targetType;
           }
-          const value = this.transform(
-            subSource,
-            subValue,
-            realTargetType,
-            undefined,
-            subValue instanceof Map,
-            level + 1
-          );
+          const value =
+            direct && realTargetType === targetType && direct.accepts(subValue)
+              ? this.transformDirect(direct.transformer, subValue, level + 1)
+              : this.transform(subSource, subValue, realTargetType, undefined, subValue instanceof Map, level + 1);
 
           if (newValue instanceof Set) {
             newValue.add(value);
@@ -173,6 +174,49 @@ export class TransformOperationExecutor {
   // -------------------------------------------------------------------------
   // Private Methods
   // -------------------------------------------------------------------------
+
+  /**
+   * Same as the forEach of the array branch of `transform`, when elements are transformed with a class having a
+   * compiled transformer (no source, no discriminator).
+   */
+  private transformArrayDirect(
+    direct: DirectTransformer,
+    value: any[],
+    newValue: any[] | Set<any>,
+    targetType: Function,
+    level: number
+  ): any[] | Set<any> {
+    const isSet = newValue instanceof Set;
+    const length = value.length;
+    for (let index = 0; index < length; index++) {
+      if (!(index in value)) continue; // forEach skips holes
+      const subValue = value[index];
+      let transformed: any;
+      if (this.options.enableCircularCheck && this.isCircular(subValue)) {
+        if (this.transformationType !== TransformationType.CLASS_TO_CLASS) continue;
+        transformed = subValue;
+      } else if (direct.accepts(subValue)) {
+        transformed = this.transformDirect(direct.transformer, subValue, level + 1);
+      } else {
+        transformed = this.transform(undefined, subValue, targetType, undefined, subValue instanceof Map, level + 1);
+      }
+      if (isSet) newValue.add(transformed);
+      else newValue.push(transformed);
+    }
+    return newValue;
+  }
+
+  /**
+   * Same as `transform(undefined, value, <type of the direct transformer>, undefined, false, level)`
+   * for a value accepted by the direct transformer.
+   */
+  private transformDirect(transformer: CompiledTransformer, value: any, level: number): any {
+    if (!this.options.enableCircularCheck) return transformer(this, undefined, value, level);
+    this.recursionStack.add(value);
+    const newValue = transformer(this, undefined, value, level);
+    this.recursionStack.delete(value);
+    return newValue;
+  }
 
   /**
    * Interpreted transformation of a single object, used when no compiled transformer is available.

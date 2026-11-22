@@ -6,6 +6,8 @@
  * Example:
  *   npx tsc -p tsconfig.prod.cjs.json --outDir build/bench && node benchmark/run.js ./build/bench
  *
+ * BENCH_FILTER=<substring> only runs the matching cases, BENCH_JSON=<file> writes the results to a JSON file.
+ *
  * Every lib build must be run in its own process: the metadata storage lives on globalThis.
  */
 require('reflect-metadata');
@@ -155,8 +157,10 @@ const cases = [
   ],
 ];
 
+// BENCH_FILTER=<substring> runs only the matching cases
+const filter = process.env.BENCH_FILTER;
 const out = {};
-for (const [name, fn] of cases) {
+for (const [name, fn] of cases.filter(([name]) => !filter || name.includes(filter))) {
   const r = bench(name, fn);
   out[name] = r.opsPerSec;
   console.error(

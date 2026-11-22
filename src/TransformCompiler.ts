@@ -90,7 +90,24 @@ function getFingerprint(transformationType: TransformationType, o: ClassTransfor
 export class JitCache {
   private version = -1;
   private classes = new WeakMap<Function, CompiledTransformer | null>();
+  private directs = new WeakMap<Function, DirectTransformer | null>();
   private anonymous: CompiledTransformer | null | undefined = undefined;
+
+  /**
+   * Returns the compiled transformer to call directly for elements of arrays of given type, or null.
+   */
+  direct(targetType: Function, executor: TransformOperationExecutor): DirectTransformer | null {
+    // get() first: it drops everything when metadata changed
+    const transformer = this.get(targetType, executor);
+    if (!transformer) return null;
+    let direct = this.directs.get(targetType);
+    if (direct === undefined || direct.transformer !== transformer) {
+      const resolved = helpers.resolveChild(executor, targetType);
+      direct = resolved ? new DirectTransformer(resolved, helpers.directPrototype(targetType)) : null;
+      this.directs.set(targetType, direct);
+    }
+    return direct;
+  }
 
   /**
    * Returns the compiled transformer for given target type (undefined when it can not be compiled).
@@ -101,6 +118,7 @@ export class JitCache {
     if (version !== this.version) {
       this.version = version;
       this.classes = new WeakMap();
+      this.directs = new WeakMap();
       this.anonymous = undefined;
     }
 
@@ -116,6 +134,21 @@ export class JitCache {
       this.classes.set(targetType, compiled);
     }
     return compiled || undefined;
+  }
+}
+
+/**
+ * Compiled transformer of a type, with the check of the values TransformOperationExecutor#transform would
+ * transform with it: plain objects and instances of the type which are not arrays, sets, dates, maps, buffers or
+ * promises.
+ */
+export class DirectTransformer {
+  constructor(readonly transformer: CompiledTransformer, private readonly prototype: any) {}
+
+  accepts(value: any): boolean {
+    if (value === null || typeof value !== 'object') return false;
+    const prototype = Object.getPrototypeOf(value);
+    return (prototype === Object.prototype || prototype === this.prototype) && typeof value.then !== 'function';
   }
 }
 
@@ -153,6 +186,44 @@ const helpers = {
     if (!(key in prototype)) return false;
     const descriptor = getPropertyDescriptor(prototype, key);
     return !!(descriptor && !descriptor.set);
+  },
+
+  /**
+   * Returns the compiled transformer to call directly for objects of given (resolved) type, or null when
+   * TransformOperationExecutor#transform would not take its object branch with this type as target.
+   */
+  resolveChild(executor: TransformOperationExecutor, type: any): CompiledTransformer | null {
+    if (typeof type !== 'function' || type === String || type === Number || type === Boolean || type === Date) {
+      return null;
+    }
+    if (!!getGlobal().Buffer && type === Buffer) return null;
+    const jit: JitCache = (executor as any).jit;
+    return (jit && jit.get(type, executor)) || null;
+  },
+
+  /**
+   * Prototype of the instances that can be passed directly to the compiled transformer of given type, besides plain
+   * objects: null when instances of the type are arrays, sets, dates, maps or buffers (handled by other branches).
+   */
+  directPrototype(type: Function): any {
+    const prototype = type.prototype;
+    if (!prototype) return null;
+    const excluded: Function[] = [Array, Set, Date, Map];
+    if (getGlobal().Buffer) excluded.push(Buffer);
+    for (const cls of excluded) {
+      if (prototype === cls.prototype || prototype instanceof cls) return null;
+    }
+    return prototype;
+  },
+
+  /** Same as instantiateArrayType in TransformOperationExecutor. */
+  newArray(arrayType: any): any {
+    if (!arrayType) return [];
+    const array = new arrayType();
+    if (!(array instanceof Set) && !('push' in array)) {
+      return [];
+    }
+    return array;
   },
 
   prefixBlocked(key: string, prefixes: string[]): boolean {
@@ -265,6 +336,9 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
   };
   const str = (value: string): string => JSON.stringify(value);
   let labelCounter = 0;
+  // per call site caches of the last resolved child type => compiled transformer
+  const siteDeclarations: string[] = [];
+  const circularCheck = !!options.enableCircularCheck;
 
   // custom @Transform() functions applied to a key, filtered exactly like applyCustomTransformations
   const getTransforms = (key: string): TransformMetadata[] => {
@@ -300,8 +374,11 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
   };
 
   /**
-   * Transformation of `fv` (sub value) into `fv`: primitives are converted inline,
-   * everything else goes through TransformOperationExecutor#transform.
+   * Transformation of `fv` (sub value) into `fv`, same as TransformOperationExecutor#transform:
+   * - primitives are converted inline,
+   * - plain objects (or instances of the target type) and arrays of them, when the type has a compiled transformer,
+   *   are passed directly to that compiled transformer,
+   * - everything else goes through TransformOperationExecutor#transform.
    */
   const emitChild = (
     typeExpr: string,
@@ -331,9 +408,56 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
       default:
         primitive = isMapExpr === 'true' ? 'fv' : `(${isMapExpr} ? fv : H.conv(fv, ${typeExpr}))`;
     }
+    const slow = `fv = ex.transform(source ? source[${valueKeyExpr}] : undefined, fv, ${typeExpr}, ${arrayTypeExpr}, ${isMapExpr}, level + 1);`;
+
+    // types which can never have a compiled transformer: no direct call
+    if (kind !== 'none' && kind !== 'dynamic') {
+      return `if (typeof fv !== 'object' || fv === null) { fv = ${primitive}; }\nelse { ${slow} }\n`;
+    }
+    if (typeExpr === 'undefined') {
+      return `if (typeof fv !== 'object' || fv === null) { fv = ${primitive}; }\nelse { ${slow} }\n`;
+    }
+
+    const site = String(siteDeclarations.length);
+    const sT = 'sT' + site; // last type seen at this call site
+    const sF = 'sF' + site; // its compiled transformer (null: not directly callable)
+    const sP = 'sP' + site; // prototype of instances which can be passed directly
+    siteDeclarations.push(`let ${sT} = UNSET, ${sF} = null, ${sP} = null;\n`);
+
+    const callDirect = (valueExpr: string, levelExpr: string) =>
+      circularCheck
+        ? `(ex.recursionStack.add(${valueExpr}), r = ${sF}(ex, undefined, ${valueExpr}, ${levelExpr}), ex.recursionStack.delete(${valueExpr}), r)`
+        : `${sF}(ex, undefined, ${valueExpr}, ${levelExpr})`;
+    const isDirect = (valueExpr: string) =>
+      `((pp = Object.getPrototypeOf(${valueExpr})) === OP || pp === ${sP}) && typeof ${valueExpr}.then !== 'function'`;
+
+    // array branch of TransformOperationExecutor#transform, with forEach and the element type checks unrolled
+    const newArray = isPlainToClass && arrayTypeExpr !== 'undefined' ? `H.newArray(${arrayTypeExpr})` : '[]';
+    const add = (valueExpr: string) =>
+      newArray === '[]' ? `arr.push(${valueExpr});` : `if (isSet) arr.add(${valueExpr}); else arr.push(${valueExpr});`;
+    let arrayCode =
+      `const n = fv.length;\nconst arr = ${newArray};\n` +
+      (newArray === '[]' ? '' : 'const isSet = arr instanceof Set;\n') +
+      `for (let j = 0; j < n; j++) {\nif (!(j in fv)) continue;\nconst el = fv[j];\n`;
+    if (circularCheck) {
+      arrayCode += `if (ex.recursionStack.has(el)) { ${isClassToClass ? add('el') : ''} continue; }\n`;
+    }
+    arrayCode +=
+      `let r;\n` +
+      `if (typeof el !== 'object' || el === null) r = el;\n` +
+      `else if (${isDirect('el')}) r = ${callDirect('el', 'level + 2')};\n` +
+      `else r = ex.transform(undefined, el, t, undefined, el instanceof Map, level + 2);\n` +
+      `${add('r')}\n}\nfv = arr;\n`;
+
     return (
       `if (typeof fv !== 'object' || fv === null) { fv = ${primitive}; }\n` +
-      `else { fv = ex.transform(source ? source[${valueKeyExpr}] : undefined, fv, ${typeExpr}, ${arrayTypeExpr}, ${isMapExpr}, level + 1); }\n`
+      `else {\nconst t = ${typeExpr};\n` +
+      `if (t !== ${sT}) { ${sT} = t; ${sF} = H.resolveChild(ex, t); ${sP} = ${sF} === null ? null : H.directPrototype(t); }\n` +
+      `let pp, r;\n` +
+      `if (${sF} === null || source) { ${slow} }\n` +
+      `else if (Array.isArray(fv) && fv.forEach === AFE) {\n${arrayCode}}\n` +
+      `else if (!${isMapExpr} && ${isDirect('fv')}) { fv = ${callDirect('fv', 'level + 1')}; }\n` +
+      `else { ${slow} }\n}\n`
     );
   };
 
@@ -428,10 +552,16 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
     if (createsInstance) {
       const staticSkip =
         key === undefined ? `H.descSkip(proto, key)` : String(helpers.descSkip(targetPrototype, newValueKey));
+      const descriptorSkip =
+        staticSkip === 'false'
+          ? `(!protoIsTarget && H.descSkip(proto, ${newKeyExpr}))`
+          : staticSkip === 'true'
+          ? `(protoIsTarget || H.descSkip(proto, ${newKeyExpr}))`
+          : `(protoIsTarget ? ${staticSkip} : H.descSkip(proto, ${newKeyExpr}))`;
+      // `newValue.constructor.prototype` is read once per object, but must throw here like the interpreter
       code +=
-        `const proto = newValue.constructor.prototype;\n` +
-        `if (proto && ((proto === ${ref(targetPrototype)} ? ${staticSkip} : H.descSkip(proto, ${newKeyExpr})) ` +
-        `|| newValue[${newKeyExpr}] instanceof Function)) break ${label};\n`;
+        `if (nvc == null) newValue.constructor.prototype;\n` +
+        `if (proto && (${descriptorSkip} || newValue[${newKeyExpr}] instanceof Function)) break ${label};\n`;
     }
 
     const transforms = key === undefined ? [] : getTransforms(transformKey);
@@ -480,6 +610,11 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
   let body = `const newValue = source ? source : ${
     createsInstance && target ? `new ${ref(target)}()` : '{}'
   };\nconst nvm = newValue instanceof Map;\n`;
+  if (createsInstance) {
+    body +=
+      `const nvc = newValue.constructor;\nconst proto = nvc == null ? undefined : nvc.prototype;\n` +
+      `const protoIsTarget = proto === ${ref(targetPrototype)};\n`;
+  }
 
   if (!dynamicKeys) {
     for (const key of staticKeys) body += emitKey(key);
@@ -497,8 +632,9 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
 
     const extraKeys = staticKeys.filter(key => key !== '__proto__' && key !== 'constructor');
     // exposed keys missing from the object are transformed after the object keys
+    // set when the key is found in the object keys
     extraKeys.forEach((key, index) => {
-      body += `const has${String(index)} = PIE.call(value, ${str(key)});\n`;
+      body += `let has${String(index)} = false;\n`;
     });
 
     let cases = `case "__proto__": case "constructor": continue;\n`;
@@ -506,7 +642,9 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
       const probe: Record<string, any> = {};
       probe[key] = true;
       const blocked = !ex.getKeys(target, probe, false).includes(key);
-      cases += blocked ? `case ${str(key)}: continue;\n` : `case ${str(key)}: ${emitKey(key)}continue;\n`;
+      const extraIndex = extraKeys.indexOf(key);
+      const seen = extraIndex === -1 ? '' : `has${String(extraIndex)} = true;\n`;
+      cases += blocked ? `case ${str(key)}: continue;\n` : `case ${str(key)}: ${seen}${emitKey(key)}continue;\n`;
     });
 
     body += `const keys = Object.keys(value);\n`;
@@ -525,8 +663,9 @@ function compile(target: Function | undefined, executor: TransformOperationExecu
 
   const declarations = constants.map((_, index) => `const k${index} = K[${index}];\n`).join('');
   const source =
-    `'use strict';\n${declarations}const PIE = Object.prototype.propertyIsEnumerable;\n` +
-    `return function compiledTransform(ex, source, value, level) {\n${body}};`;
+    `'use strict';\n${declarations}const OP = Object.prototype;\nconst AFE = Array.prototype.forEach;\nconst UNSET = {};\n${siteDeclarations.join(
+      ''
+    )}` + `return function compiledTransform(ex, source, value, level) {\n${body}};`;
 
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
   const factory = new Function('K', 'H', source) as (constants: any[], h: typeof helpers) => CompiledTransformer;
