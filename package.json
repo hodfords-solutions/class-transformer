@@ -1,18 +1,22 @@
 {
-  "name": "class-transformer",
-  "version": "0.5.1",
+  "name": "@hodfords/turbo-transformer",
+  "version": "1.0.0",
   "description": "Proper decorator-based transformation / serialization / deserialization of plain javascript objects to class constructors",
   "author": "TypeStack contributors",
   "license": "MIT",
+  "private": false,
   "readmeFilename": "README.md",
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./cjs/index.js",
   "module": "./esm5/index.js",
   "es2015": "./esm2015/index.js",
   "typings": "./types/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/typestack/class-transformer.git"
+    "url": "git+https://github.com/hodfords-solutions/class-transformer.git"
   },
   "tags": [
     "serialization",
@@ -36,7 +40,8 @@
     "lint:check": "eslint --max-warnings 0 --ext .ts src/",
     "test": "jest --coverage --verbose",
     "test:watch": "jest --watch",
-    "test:ci": "jest --runInBand --no-cache --coverage --verbose"
+    "test:ci": "jest --runInBand --no-cache --coverage --verbose",
+    "benchmark": "tsc --project tsconfig.prod.cjs.json --outDir build/benchmark && node benchmark/run.js build/benchmark current"
   },
   "husky": {
     "hooks": {
